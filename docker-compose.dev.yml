@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai_classroom_db
+    environment:
+      POSTGRES_USER: classroom_user
+      POSTGRES_PASSWORD: dev_password_change_me
+      POSTGRES_DB: ai_classroom_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U classroom_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: ai_classroom_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Elasticsearch/Opensearch
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: ai_classroom_search
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Admin@1234567
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: ai_classroom_backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://classroom_user:dev_password_change_me@postgres:5432/ai_classroom_db
+      REDIS_URL: redis://redis:6379
+      OPENSEARCH_HOST: opensearch:9200
+      ENV: development
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Node.js WebSocket/Realtime Service
+  realtime:
+    build:
+      context: ./services/realtime
+      dockerfile: Dockerfile.dev
+    container_name: ai_classroom_realtime
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      REDIS_URL: redis://redis:6379
+      BACKEND_URL: http://backend:8000
+    volumes:
+      - ./services/realtime:/app
+    depends_on:
+      - redis
+    command: npm run dev
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: ai_classroom_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_REALTIME_URL: http://localhost:3001
+      NODE_ENV: development
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+      - realtime
+    command: npm run dev
+
+  # MinIO (Local S3-compatible storage for development)
+  minio:
+    image: minio/minio:latest
+    container_name: ai_classroom_storage
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+volumes:
+  postgres_data:
+  opensearch_data:
+  minio_data:
+
+networks:
+  default:
+    name: ai_classroom_network
